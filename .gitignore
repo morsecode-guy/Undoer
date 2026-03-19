@@ -1,0 +1,16 @@
+# build output
+bin/
+obj/
+
+# game dump - do not distribute
+Assembly-CSharp
+
+# ide
+.vs/
+.idea/
+*.user
+*.suo
+
+# os
+.DS_Store
+Thumbs.db

@@ -1,0 +1,24 @@
+Microsoft Visual Studio Solution File, Format Version 12.00
+# Visual Studio Version 17
+VisualStudioVersion = 17.5.2.0
+MinimumVisualStudioVersion = 10.0.40219.1
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "UndoMod", "UndoMod\UndoMod.csproj", "{934FC0D4-5341-0443-26B3-F606488A7FAA}"
+EndProject
+Global
+	GlobalSection(SolutionConfigurationPlatforms) = preSolution
+		Debug|Any CPU = Debug|Any CPU
+		Release|Any CPU = Release|Any CPU
+	EndGlobalSection
+	GlobalSection(ProjectConfigurationPlatforms) = postSolution
+		{934FC0D4-5341-0443-26B3-F606488A7FAA}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{934FC0D4-5341-0443-26B3-F606488A7FAA}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{934FC0D4-5341-0443-26B3-F606488A7FAA}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{934FC0D4-5341-0443-26B3-F606488A7FAA}.Release|Any CPU.Build.0 = Release|Any CPU
+	EndGlobalSection
+	GlobalSection(SolutionProperties) = preSolution
+		HideSolutionNode = FALSE
+	EndGlobalSection
+	GlobalSection(ExtensibilityGlobals) = postSolution
+		SolutionGuid = {F18E0CDC-1596-4500-AC53-131A49A2BD32}
+	EndGlobalSection
+EndGlobal
