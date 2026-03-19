@@ -1,0 +1,10 @@
+{
+  "version": 2,
+  "dgSpecHash": "v7+mOZErjY4cUqHct3d+WIlQhUjX8+1iLP9ySwDZOkN2dbnAfwFgZqSGrt06JQlzrmrqzqsMBK9bw5U+EmR2xw==",
+  "success": true,
+  "projectFilePath": "/home/morse-code-guy/Documents/Undoer/UndoMod/UndoMod.csproj",
+  "expectedPackageFiles": [
+    "/home/morse-code-guy/.nuget/packages/microsoft.aspnetcore.app.ref/6.0.36/microsoft.aspnetcore.app.ref.6.0.36.nupkg.sha512"
+  ],
+  "logs": []
+}
