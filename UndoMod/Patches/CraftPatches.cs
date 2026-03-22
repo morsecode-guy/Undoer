@@ -47,7 +47,7 @@ namespace UndoMod
             if (UndoMod.IsRestoring || !UndoMod.InCraftEditor || !__result) return;
             UndoMod.UndoStack.Clear();
             UndoMod.CurrentIndex = -1;
-            UndoMod.TakeSnapshot("load");
+            UndoMod.TakeSnapshot("load", structural: true);
         }
     }
 }

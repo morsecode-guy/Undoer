@@ -12,16 +12,16 @@ namespace UndoMod
     static class Patch_FusApply { static void Postfix() => SnapHelper.Do(); }
 
     [HarmonyPatch(typeof(EditableFuselage), nameof(EditableFuselage.LoopCut))]
-    static class Patch_FusLoopCut { static void Postfix() => SnapHelper.Do(); }
+    static class Patch_FusLoopCut { static void Postfix() => SnapHelper.DoStructural(); }
 
     [HarmonyPatch(typeof(EditableFuselage), nameof(EditableFuselage.AddSegment))]
-    static class Patch_FusAddSeg { static void Postfix() => SnapHelper.Do(); }
+    static class Patch_FusAddSeg { static void Postfix() => SnapHelper.DoStructural(); }
 
     [HarmonyPatch(typeof(EditableFuselage), nameof(EditableFuselage.Split))]
-    static class Patch_FusSplit { static void Postfix() => SnapHelper.Do(); }
+    static class Patch_FusSplit { static void Postfix() => SnapHelper.DoStructural(); }
 
     [HarmonyPatch(typeof(EditableFuselage), nameof(EditableFuselage.DeleteSegment))]
-    static class Patch_FusDelSeg { static void Postfix() => SnapHelper.Do(); }
+    static class Patch_FusDelSeg { static void Postfix() => SnapHelper.DoStructural(); }
 
     [HarmonyPatch(typeof(EditableFuselage), nameof(EditableFuselage.SetSkinThickness))]
     static class Patch_FusSkin { static void Postfix() => SnapHelper.Do(); }
