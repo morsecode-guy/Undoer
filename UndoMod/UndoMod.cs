@@ -28,6 +28,9 @@ namespace UndoMod
         /// <summary>data.txt content (always set)</summary>
         public string CraftText;
 
+        /// <summary>meta.txt content (required by LoadCraft)</summary>
+        public string MetaText;
+
         /// <summary>
         /// Path to a Textures folder on disk. Shared between entries
         /// that don't change paint. Null when no paint data exists.
@@ -86,6 +89,7 @@ namespace UndoMod
         // cached header/footer for building data.txt in memory
         static string _cachedHeader;   // everything before first Part block
         static string _cachedFooter;   // the |-----| line at end
+        static string _cachedMeta;     // meta.txt content
 
         // -----------------------------------------------------------
         // init
@@ -395,6 +399,11 @@ namespace UndoMod
             // cache header/footer for future in-memory snapshots
             CacheHeaderFooter(craftText);
 
+            // cache meta.txt for in-memory entries
+            string metaFile = Path.Combine(path, "meta.txt");
+            if (File.Exists(metaFile))
+                _cachedMeta = File.ReadAllText(metaFile);
+
             // figure out texture path for this entry
             string texDir2 = Path.Combine(path, "Textures");
             string texPath = Directory.Exists(texDir2) &&
@@ -405,6 +414,7 @@ namespace UndoMod
             return new UndoEntry
             {
                 CraftText = craftText,
+                MetaText = _cachedMeta,
                 TexturePath = texPath,
                 DiskFolder = path
             };
@@ -442,6 +452,7 @@ namespace UndoMod
             return new UndoEntry
             {
                 CraftText = sb.ToString(),
+                MetaText = _cachedMeta,
                 TexturePath = texPath,
                 DiskFolder = null   // not on disk
             };
@@ -459,10 +470,10 @@ namespace UndoMod
             if (idx >= 0)
                 _cachedHeader = craftText.Substring(0, idx + 1);
 
-            // footer: last line starting with |
-            int lastPipe = craftText.LastIndexOf('|');
-            if (lastPipe >= 0)
-                _cachedFooter = craftText.Substring(lastPipe);
+            // footer: the |---...---| separator line at the end
+            int footerIdx = craftText.LastIndexOf("\n|---");
+            if (footerIdx >= 0)
+                _cachedFooter = craftText.Substring(footerIdx + 1); // skip the \n
             else
                 _cachedFooter = "|---------------------------------------------------------------------|\n";
         }
@@ -564,6 +575,12 @@ namespace UndoMod
                     File.WriteAllText(
                         Path.Combine(loadFolder, "data.txt"),
                         entry.CraftText);
+
+                    // write meta.txt (required by LoadCraft)
+                    if (entry.MetaText != null)
+                        File.WriteAllText(
+                            Path.Combine(loadFolder, "meta.txt"),
+                            entry.MetaText);
 
                     // copy textures
                     if (entry.TexturePath != null && Directory.Exists(entry.TexturePath))
@@ -701,6 +718,7 @@ namespace UndoMod
             PendingStructural = false;
             _cachedHeader = null;
             _cachedFooter = null;
+            _cachedMeta = null;
         }
 
         static void CleanupEntry(UndoEntry entry)
