@@ -32,7 +32,7 @@ namespace UndoMod
         // snapshot debounce
         internal static float LastSnapshotTime;
         internal static bool SnapshotPending;
-        internal static float SnapshotDelay = 0.35f;
+        internal static float SnapshotDelay = 0.5f;
 
         // config
         static readonly int[] MemoryPresets = { 50, 100, 200, 500 };
@@ -221,6 +221,11 @@ namespace UndoMod
             var mgr = CEManager.instance;
             if (mgr == null || mgr.craft == null) return;
 
+            // save persistence state BEFORE serialization
+            string savedLoaded = Persistence.currentlyLoaded;
+            bool savedTemp = Persistence.isTemp;
+            string savedRoot = Persistence.currentRootFolder;
+
             try
             {
                 string name = $"undo_{DateTime.Now:yyyyMMdd_HHmmss_fff}.craft";
@@ -253,6 +258,14 @@ namespace UndoMod
             catch (Exception ex)
             {
                 Melon<UndoMod>.Logger.Error($"Snapshot failed: {ex}");
+            }
+            finally
+            {
+                // restore persistence immediately so the game still
+                // thinks it has the real craft loaded, not our temp
+                Persistence.currentlyLoaded = savedLoaded;
+                Persistence.isTemp = savedTemp;
+                Persistence.currentRootFolder = savedRoot;
             }
         }
 
@@ -371,17 +384,20 @@ namespace UndoMod
                         cam2.ResetVelocity();
                     }
 
-                    // delay restoring persistence so texture coroutines
-                    // can finish loading PNGs from the snapshot directory
-                    MelonCoroutines.Start(
-                        DelayedRestorePersistence(prevLoaded, prevTemp, prevRoot));
+                    // restore persistence immediately — LoadCraft
+                    // overwrites these to point at our temp dir, which
+                    // would corrupt the next normal save
+                    Persistence.currentlyLoaded = prevLoaded;
+                    Persistence.isTemp = prevTemp;
+                    Persistence.currentRootFolder = prevRoot;
 
-                    // re-enter the previous mode so paint targets etc get
-                    // re-initialised against the newly loaded GameObjects
+                    // re-enter the previous mode AFTER textures finish
+                    // loading (the Paintable coroutines need a few frames)
+                    // so we don't wipe paint by cycling too early
                     if (prevMode != Mode.Edit)
                     {
-                        mgr.SetMode(Mode.Edit);
-                        mgr.SetMode(prevMode);
+                        MelonCoroutines.Start(
+                            DelayedModeRestore(prevMode));
                     }
                 }
                 else
@@ -445,17 +461,22 @@ namespace UndoMod
         // -----------------------------------------------------------
 
         // waits for texture loading coroutines to finish before
-        // restoring the persistence state back to the real craft
-        static IEnumerator DelayedRestorePersistence(
-            string loaded, bool temp, string root)
+        // re-entering paint mode so paintable references get
+        // refreshed against the newly loaded GameObjects
+        static IEnumerator DelayedModeRestore(Mode targetMode)
         {
+            // wait for Paintable.IEConstructFromData coroutines
+            // to finish loading PNGs from the snapshot directory
             yield return null;
             yield return null;
             yield return new WaitForSeconds(0.5f);
 
-            Persistence.currentlyLoaded = loaded;
-            Persistence.isTemp = temp;
-            Persistence.currentRootFolder = root;
+            var mgr = CEManager.instance;
+            if (mgr != null)
+            {
+                mgr.SetMode(Mode.Edit);
+                mgr.SetMode(targetMode);
+            }
         }
 
         void ClearHistory()
