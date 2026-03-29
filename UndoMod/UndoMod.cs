@@ -19,12 +19,12 @@ namespace UndoMod
     // one undo/redo entry, lives entirely in memory :3
     internal class UndoEntry
     {
-        public string CraftData;   // data.txt contents
-        public string MetaData;    // meta.txt contents
+        // all files in the .craft folder, keyed by relative path
+        // e.g. "data.txt", "Textures/part_0.png", "Blueprints/bp.png"
+        public Dictionary<string, byte[]> Files;
 
-        // texture pngs keyed by filename, null if no paint
-        // entries that didnt change paint share the same dict
-        public Dictionary<string, byte[]> Textures;
+        // prev textures dict ref for sharing between non-paint entries
+        public Dictionary<string, byte[]> SharedTextures;
     }
 
     public class UndoMod : MelonMod
@@ -287,8 +287,8 @@ namespace UndoMod
             {
                 for (int i = UndoStack.Count - 1; i >= 0; i--)
                 {
-                    if (UndoStack[i].Textures != null && UndoStack[i].Textures.Count > 0)
-                    { prevTex = UndoStack[i].Textures; break; }
+                    if (UndoStack[i].SharedTextures != null && UndoStack[i].SharedTextures.Count > 0)
+                    { prevTex = UndoStack[i].SharedTextures; break; }
                 }
             }
 
@@ -329,39 +329,46 @@ namespace UndoMod
                 Persistence.currentRootFolder = savedRoot;
             }
 
-            // slurp data.txt into memory
+            // slurp ALL files into memory
             string dataFile = Path.Combine(ScratchDir, "data.txt");
             if (!File.Exists(dataFile)) return null;
-            string craftData = File.ReadAllText(dataFile);
 
-            // slurp meta.txt
-            string metaFile = Path.Combine(ScratchDir, "meta.txt");
-            string metaData = File.Exists(metaFile) ? File.ReadAllText(metaFile) : null;
+            var files = new Dictionary<string, byte[]>();
+            SlurpDirectory(ScratchDir, ScratchDir, files);
 
-            // slurp textures into memory (or reuse prev)
-            Dictionary<string, byte[]> textures = null;
-            string texDir = Path.Combine(ScratchDir, "Textures");
-            if (Directory.Exists(texDir))
-            {
-                var files = Directory.GetFiles(texDir);
-                if (files.Length > 0)
-                {
-                    textures = new Dictionary<string, byte[]>(files.Length);
-                    foreach (var f in files)
-                        textures[Path.GetFileName(f)] = File.ReadAllBytes(f);
-                }
-            }
-            textures ??= prevTex;
+            // figure out shared textures for this entry
+            // (either freshly encoded or reused from prev)
+            var texFiles = new Dictionary<string, byte[]>();
+            foreach (var kv in files)
+                if (kv.Key.StartsWith("Textures/") || kv.Key.StartsWith("Textures\\"))
+                    texFiles[kv.Key] = kv.Value;
+            var sharedTex = texFiles.Count > 0 ? texFiles : prevTex;
+
+            // if we skipped encoding, patch in the prev textures
+            if (prevTex != null && texFiles.Count == 0)
+                foreach (var kv in prevTex)
+                    files[kv.Key] = kv.Value;
 
             // done with disk, wipe it
             WipeScratch();
 
             return new UndoEntry
             {
-                CraftData = craftData,
-                MetaData = metaData,
-                Textures = textures
+                Files = files,
+                SharedTextures = sharedTex
             };
+        }
+
+        // recursively read all files in a directory into the dict
+        static void SlurpDirectory(string root, string dir, Dictionary<string, byte[]> files)
+        {
+            foreach (var f in Directory.GetFiles(dir))
+            {
+                string rel = f.Substring(root.Length + 1).Replace('\\', '/');
+                files[rel] = File.ReadAllBytes(f);
+            }
+            foreach (var d in Directory.GetDirectories(dir))
+                SlurpDirectory(root, d, files);
         }
 
         // capture the real craft path so we can restore it later
@@ -428,7 +435,7 @@ namespace UndoMod
         void Restore(UndoEntry entry)
         {
             var mgr = CEManager.instance;
-            if (mgr == null || entry == null || entry.CraftData == null) return;
+            if (mgr == null || entry == null || entry.Files == null) return;
 
             try
             {
@@ -456,27 +463,54 @@ namespace UndoMod
                     savedOrthoZoom = ceCam.orthoZoom;
                 }
 
-                // write entry from memory to scratch folder
-                WipeScratch();
-                File.WriteAllText(Path.Combine(ScratchDir, "data.txt"), entry.CraftData);
-                if (entry.MetaData != null)
-                    File.WriteAllText(Path.Combine(ScratchDir, "meta.txt"), entry.MetaData);
-                if (entry.Textures != null && entry.Textures.Count > 0)
+                // save blueprints before LoadCraft clears them
+                var savedBlueprints = new List<Il2CppSystem.Collections.Generic.List<string>>();
+                var bpToolPre = mgr.blueprintTool;
+                if (bpToolPre != null && bpToolPre.blueprints != null)
                 {
-                    string texDir = Path.Combine(ScratchDir, "Textures");
-                    Directory.CreateDirectory(texDir);
-                    foreach (var kv in entry.Textures)
-                        File.WriteAllBytes(Path.Combine(texDir, kv.Key), kv.Value);
+                    foreach (var bp in bpToolPre.blueprints)
+                    {
+                        if (bp == null) continue;
+                        string serialized = bp.Serialize();
+                        if (string.IsNullOrEmpty(serialized)) continue;
+                        var lines = new Il2CppSystem.Collections.Generic.List<string>();
+                        foreach (var line in serialized.Split('\n'))
+                            lines.Add(line);
+                        savedBlueprints.Add(lines);
+                    }
+                }
+
+                // write all files from memory to scratch
+                WipeScratch();
+                foreach (var kv in entry.Files)
+                {
+                    string dest = Path.Combine(ScratchDir, kv.Key);
+                    string dir = Path.GetDirectoryName(dest);
+                    if (!Directory.Exists(dir))
+                        Directory.CreateDirectory(dir);
+                    File.WriteAllBytes(dest, kv.Value);
                 }
 
                 bool ok = mgr.LoadCraft(Path.Combine(ScratchDir, "data.txt"));
 
-                // clean up scratch immediately
-                WipeScratch();
+                // dont wipe scratch here — game may load images async
+                // it gets wiped at the start of the next snapshot or restore
 
                 if (ok)
                 {
                     LoggerInstance.Msg($"Restored snapshot {CurrentIndex}");
+
+                    // restore blueprints — LoadCraft wipes them but they're
+                    // not part of the craft data, they're a separate system
+                    if (savedBlueprints != null && savedBlueprints.Count > 0)
+                    {
+                        var bpTool = mgr.blueprintTool;
+                        if (bpTool != null)
+                        {
+                            foreach (var bpData in savedBlueprints)
+                                bpTool.LoadBluePrintFromData(bpData);
+                        }
+                    }
 
                     // keep the camera where it was
                     _camPos = savedPos;
