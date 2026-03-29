@@ -41,6 +41,9 @@ namespace UndoMod
         internal static string RealCurrentlyLoaded;
         internal static bool RealIsTemp;
         internal static string RealCurrentRootFolder;
+        internal static bool RealSaveAs;
+        internal static bool RealIsAutoSave;
+        internal static int RealSavedTextureCount;
         static bool _realPersistenceValid;
 
         // cooldown after restore so we dont snapshot the restore itself
@@ -133,6 +136,9 @@ namespace UndoMod
                     Persistence.currentlyLoaded = RealCurrentlyLoaded;
                     Persistence.isTemp = RealIsTemp;
                     Persistence.currentRootFolder = RealCurrentRootFolder;
+                    Persistence.saveAs = RealSaveAs;
+                    Persistence.isAutoSave = RealIsAutoSave;
+                    Persistence.savedTextureCount = RealSavedTextureCount;
                 }
                 else if (cl != null && cl != RealCurrentlyLoaded)
                 {
@@ -278,6 +284,9 @@ namespace UndoMod
             string savedLoaded = _realPersistenceValid ? RealCurrentlyLoaded : Persistence.currentlyLoaded;
             bool savedTemp = _realPersistenceValid ? RealIsTemp : Persistence.isTemp;
             string savedRoot = _realPersistenceValid ? RealCurrentRootFolder : Persistence.currentRootFolder;
+            bool savedSaveAs = _realPersistenceValid ? RealSaveAs : Persistence.saveAs;
+            bool savedIsAutoSave = _realPersistenceValid ? RealIsAutoSave : Persistence.isAutoSave;
+            int savedTexCount = _realPersistenceValid ? RealSavedTextureCount : Persistence.savedTextureCount;
 
             bool isPaint = mgr.Mode == Il2CppCraftEditor.Mode.Paint;
 
@@ -327,6 +336,9 @@ namespace UndoMod
                 Persistence.currentlyLoaded = savedLoaded;
                 Persistence.isTemp = savedTemp;
                 Persistence.currentRootFolder = savedRoot;
+                Persistence.saveAs = savedSaveAs;
+                Persistence.isAutoSave = savedIsAutoSave;
+                Persistence.savedTextureCount = savedTexCount;
             }
 
             // slurp ALL files into memory
@@ -377,8 +389,23 @@ namespace UndoMod
             RealCurrentlyLoaded = Persistence.currentlyLoaded;
             RealIsTemp = Persistence.isTemp;
             RealCurrentRootFolder = Persistence.currentRootFolder;
+            RealSaveAs = Persistence.saveAs;
+            RealIsAutoSave = Persistence.isAutoSave;
+            RealSavedTextureCount = Persistence.savedTextureCount;
             _realPersistenceValid = true;
             Melon<UndoMod>.Logger.Msg($"Real persistence: {RealCurrentlyLoaded}");
+        }
+
+        // force persistence back to real state — used before saves
+        internal static void ForceRealPersistence()
+        {
+            if (!_realPersistenceValid) return;
+            Persistence.currentlyLoaded = RealCurrentlyLoaded;
+            Persistence.isTemp = RealIsTemp;
+            Persistence.currentRootFolder = RealCurrentRootFolder;
+            Persistence.saveAs = RealSaveAs;
+            Persistence.isAutoSave = RealIsAutoSave;
+            Persistence.savedTextureCount = RealSavedTextureCount;
         }
 
         static bool IsScratchPath(string path)
@@ -387,6 +414,9 @@ namespace UndoMod
             var parent = Path.GetDirectoryName(ScratchDir);
             return path.Replace('\\', '/').StartsWith(parent.Replace('\\', '/'));
         }
+
+        // public version for patches to use
+        internal static bool IsScratchPathPublic(string path) => IsScratchPath(path);
 
         // grab initial snapshot when the stack is empty
         internal static void TakeInitialSnapshot()
@@ -444,6 +474,9 @@ namespace UndoMod
                 string prevLoaded = _realPersistenceValid ? RealCurrentlyLoaded : Persistence.currentlyLoaded;
                 bool prevTemp = _realPersistenceValid ? RealIsTemp : Persistence.isTemp;
                 string prevRoot = _realPersistenceValid ? RealCurrentRootFolder : Persistence.currentRootFolder;
+                bool prevSaveAs = _realPersistenceValid ? RealSaveAs : Persistence.saveAs;
+                bool prevIsAutoSave = _realPersistenceValid ? RealIsAutoSave : Persistence.isAutoSave;
+                int prevTexCount = _realPersistenceValid ? RealSavedTextureCount : Persistence.savedTextureCount;
                 Mode prevMode = mgr.Mode;
 
                 // save camera state before LoadCraft nukes it
@@ -537,6 +570,9 @@ namespace UndoMod
                     Persistence.currentlyLoaded = prevLoaded;
                     Persistence.isTemp = prevTemp;
                     Persistence.currentRootFolder = prevRoot;
+                    Persistence.saveAs = prevSaveAs;
+                    Persistence.isAutoSave = prevIsAutoSave;
+                    Persistence.savedTextureCount = prevTexCount;
 
                     // go back to paint mode if we were painting
                     if (prevMode != Mode.Edit)
