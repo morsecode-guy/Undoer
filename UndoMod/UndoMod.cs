@@ -11,19 +11,20 @@ using UnityEngine.InputSystem;
 using Il2CppCraftEditor;
 using Il2Cpp;
 
-[assembly: MelonInfo(typeof(UndoMod.UndoMod), "Undoer", "2.3.0", "Morse Code Guy")]
+[assembly: MelonInfo(typeof(UndoMod.UndoMod), "Undoer", "3.0.0", "Morse Code Guy")]
 [assembly: MelonGame("Stonext Games", "Flyout")]
 
 namespace UndoMod
 {
-    // one undo/redo entry — full craft state on disk
+    // one undo/redo entry, lives entirely in memory :3
     internal class UndoEntry
     {
-        // path to the .craft folder (has data.txt, meta.txt, Textures/)
-        public string DiskFolder;
+        public string CraftData;   // data.txt contents
+        public string MetaData;    // meta.txt contents
 
-        // shared texture folder, null if no paint data
-        public string TexturePath;
+        // texture pngs keyed by filename, null if no paint
+        // entries that didnt change paint share the same dict
+        public Dictionary<string, byte[]> Textures;
     }
 
     public class UndoMod : MelonMod
@@ -32,7 +33,7 @@ namespace UndoMod
         internal static int CurrentIndex = -1;
         internal static bool IsRestoring;
         internal static bool InCraftEditor;
-        internal static string UndoTempDir;
+        internal static string ScratchDir; // single reusable temp folder for serialize/load
         static bool _patchesDone;
 
         // the "real" persistence state — game's SerializeCraft and LoadCraft
@@ -70,15 +71,15 @@ namespace UndoMod
 
         public override void OnInitializeMelon()
         {
-            UndoTempDir = Path.Combine(
+            ScratchDir = Path.Combine(
                 Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
-                "Flyout", "UndoMod");
+                "Flyout", "UndoMod", "scratch.craft");
 
-            if (Directory.Exists(UndoTempDir))
-                Directory.Delete(UndoTempDir, true);
+            if (Directory.Exists(ScratchDir))
+                Directory.Delete(ScratchDir, true);
 
-            Directory.CreateDirectory(UndoTempDir);
-            LoggerInstance.Msg("Undoer ready  |  temp: " + UndoTempDir);
+            Directory.CreateDirectory(ScratchDir);
+            LoggerInstance.Msg("Undoer ready  |  in-memory snapshots");
         }
 
         // --- scene tracking ---
@@ -123,11 +124,11 @@ namespace UndoMod
                 TakeSnapshot("action");
             }
 
-            // persistence guard: if the game drifted to our temp dir, fix it
+            // persistence guard: if the game drifted to our scratch dir, fix it
             if (_realPersistenceValid && !IsRestoring)
             {
                 var cl = Persistence.currentlyLoaded;
-                if (IsUndoTempPath(cl))
+                if (IsScratchPath(cl))
                 {
                     Persistence.currentlyLoaded = RealCurrentlyLoaded;
                     Persistence.isTemp = RealIsTemp;
@@ -249,10 +250,7 @@ namespace UndoMod
                 // trim redo history ahead of us
                 if (CurrentIndex < UndoStack.Count - 1)
                     for (int i = UndoStack.Count - 1; i > CurrentIndex; i--)
-                    {
-                        CleanupEntry(UndoStack[i]);
                         UndoStack.RemoveAt(i);
-                    }
 
                 UndoStack.Add(entry);
                 CurrentIndex = UndoStack.Count - 1;
@@ -260,13 +258,12 @@ namespace UndoMod
                 // cap stack size
                 while (UndoStack.Count > MaxUndoSteps)
                 {
-                    CleanupEntry(UndoStack[0]);
                     UndoStack.RemoveAt(0);
                     CurrentIndex--;
                 }
 
                 Melon<UndoMod>.Logger.Msg(
-                    $"[{CurrentIndex}] {reason}: {Path.GetFileName(entry.DiskFolder)}");
+                    $"[{CurrentIndex}] {reason}  ({UndoStack.Count} in memory)");
             }
             catch (Exception ex)
             {
@@ -274,35 +271,30 @@ namespace UndoMod
             }
         }
 
-        // full serialize via Persistence.SerializeCraft
-        // hasBeenModified trick: skip png encoding when not painting
-        // and just copy textures from prev entry instead :3
+        // full serialize via Persistence.SerializeCraft into the scratch
+        // folder, slurp everything into memory, then wipe the folder :3
         static UndoEntry TakeFullSnapshot(CEManager mgr)
         {
             string savedLoaded = _realPersistenceValid ? RealCurrentlyLoaded : Persistence.currentlyLoaded;
             bool savedTemp = _realPersistenceValid ? RealIsTemp : Persistence.isTemp;
             string savedRoot = _realPersistenceValid ? RealCurrentRootFolder : Persistence.currentRootFolder;
 
-            string name = $"undo_{DateTime.Now:yyyyMMdd_HHmmss_fff}.craft";
-            string path = Path.Combine(UndoTempDir, name);
-
             bool isPaint = mgr.Mode == Il2CppCraftEditor.Mode.Paint;
 
             // reuse prev entry's textures if we're not painting
-            string prevTexDir = null;
+            Dictionary<string, byte[]> prevTex = null;
             if (!isPaint)
             {
                 for (int i = UndoStack.Count - 1; i >= 0; i--)
                 {
-                    var tp = UndoStack[i].TexturePath;
-                    if (tp != null && Directory.Exists(tp))
-                    { prevTexDir = tp; break; }
+                    if (UndoStack[i].Textures != null && UndoStack[i].Textures.Count > 0)
+                    { prevTex = UndoStack[i].Textures; break; }
                 }
             }
 
             // fake hasBeenModified to skip expensive png encoding
             List<Paintable> modified = null;
-            if (prevTexDir != null)
+            if (prevTex != null)
             {
                 modified = new List<Paintable>();
                 foreach (var part in mgr.craft.parts)
@@ -317,9 +309,12 @@ namespace UndoMod
                 }
             }
 
+            // wipe scratch folder before writing
+            WipeScratch();
+
             try
             {
-                Persistence.SerializeCraft(mgr.craft, path, true);
+                Persistence.SerializeCraft(mgr.craft, ScratchDir, true);
             }
             finally
             {
@@ -334,29 +329,38 @@ namespace UndoMod
                 Persistence.currentRootFolder = savedRoot;
             }
 
-            // copy textures from prev if we skipped encoding
-            if (prevTexDir != null)
-            {
-                string newTexDir = Path.Combine(path, "Textures");
-                Directory.CreateDirectory(newTexDir);
-                foreach (var file in Directory.GetFiles(prevTexDir))
-                    File.Copy(file, Path.Combine(newTexDir, Path.GetFileName(file)), true);
-            }
-
-            string dataFile = Path.Combine(path, "data.txt");
+            // slurp data.txt into memory
+            string dataFile = Path.Combine(ScratchDir, "data.txt");
             if (!File.Exists(dataFile)) return null;
+            string craftData = File.ReadAllText(dataFile);
 
-            // figure out which texture folder this entry gets
-            string texDir2 = Path.Combine(path, "Textures");
-            string texPath = Directory.Exists(texDir2) &&
-                             Directory.GetFiles(texDir2).Length > 0
-                             ? texDir2
-                             : prevTexDir;
+            // slurp meta.txt
+            string metaFile = Path.Combine(ScratchDir, "meta.txt");
+            string metaData = File.Exists(metaFile) ? File.ReadAllText(metaFile) : null;
+
+            // slurp textures into memory (or reuse prev)
+            Dictionary<string, byte[]> textures = null;
+            string texDir = Path.Combine(ScratchDir, "Textures");
+            if (Directory.Exists(texDir))
+            {
+                var files = Directory.GetFiles(texDir);
+                if (files.Length > 0)
+                {
+                    textures = new Dictionary<string, byte[]>(files.Length);
+                    foreach (var f in files)
+                        textures[Path.GetFileName(f)] = File.ReadAllBytes(f);
+                }
+            }
+            textures ??= prevTex;
+
+            // done with disk, wipe it
+            WipeScratch();
 
             return new UndoEntry
             {
-                TexturePath = texPath,
-                DiskFolder = path
+                CraftData = craftData,
+                MetaData = metaData,
+                Textures = textures
             };
         }
 
@@ -370,10 +374,11 @@ namespace UndoMod
             Melon<UndoMod>.Logger.Msg($"Real persistence: {RealCurrentlyLoaded}");
         }
 
-        static bool IsUndoTempPath(string path)
+        static bool IsScratchPath(string path)
         {
-            if (string.IsNullOrEmpty(path) || string.IsNullOrEmpty(UndoTempDir)) return false;
-            return path.Replace('\\', '/').StartsWith(UndoTempDir.Replace('\\', '/'));
+            if (string.IsNullOrEmpty(path) || string.IsNullOrEmpty(ScratchDir)) return false;
+            var parent = Path.GetDirectoryName(ScratchDir);
+            return path.Replace('\\', '/').StartsWith(parent.Replace('\\', '/'));
         }
 
         // grab initial snapshot when the stack is empty
@@ -423,13 +428,7 @@ namespace UndoMod
         void Restore(UndoEntry entry)
         {
             var mgr = CEManager.instance;
-            if (mgr == null || entry == null) return;
-
-            if (entry.DiskFolder == null || !Directory.Exists(entry.DiskFolder))
-            {
-                LoggerInstance.Error($"Snapshot folder missing: {entry.DiskFolder}");
-                return;
-            }
+            if (mgr == null || entry == null || entry.CraftData == null) return;
 
             try
             {
@@ -457,7 +456,23 @@ namespace UndoMod
                     savedOrthoZoom = ceCam.orthoZoom;
                 }
 
-                bool ok = mgr.LoadCraft(Path.Combine(entry.DiskFolder, "data.txt"));
+                // write entry from memory to scratch folder
+                WipeScratch();
+                File.WriteAllText(Path.Combine(ScratchDir, "data.txt"), entry.CraftData);
+                if (entry.MetaData != null)
+                    File.WriteAllText(Path.Combine(ScratchDir, "meta.txt"), entry.MetaData);
+                if (entry.Textures != null && entry.Textures.Count > 0)
+                {
+                    string texDir = Path.Combine(ScratchDir, "Textures");
+                    Directory.CreateDirectory(texDir);
+                    foreach (var kv in entry.Textures)
+                        File.WriteAllBytes(Path.Combine(texDir, kv.Key), kv.Value);
+                }
+
+                bool ok = mgr.LoadCraft(Path.Combine(ScratchDir, "data.txt"));
+
+                // clean up scratch immediately
+                WipeScratch();
 
                 if (ok)
                 {
@@ -559,24 +574,22 @@ namespace UndoMod
 
         void ClearHistory()
         {
-            foreach (var e in UndoStack) CleanupEntry(e);
             UndoStack.Clear();
             CurrentIndex = -1;
             SnapshotPending = false;
             _realPersistenceValid = false;
         }
 
-        static void CleanupEntry(UndoEntry entry)
+        // wipe and recreate the single scratch folder
+        static void WipeScratch()
         {
-            if (entry?.DiskFolder != null)
+            try
             {
-                try
-                {
-                    if (Directory.Exists(entry.DiskFolder))
-                        Directory.Delete(entry.DiskFolder, true);
-                }
-                catch { }
+                if (Directory.Exists(ScratchDir))
+                    Directory.Delete(ScratchDir, true);
             }
+            catch { }
+            Directory.CreateDirectory(ScratchDir);
         }
 
         static void ShowStatus(string text)
