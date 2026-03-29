@@ -97,7 +97,17 @@ namespace UndoMod
             UndoMod.UndoStack.Clear();
             UndoMod.CurrentIndex = -1;
             UndoMod.SnapshotPending = false;
+            UndoMod.InitialSnapshotDone = false;
             UndoMod.CaptureRealPersistence();
+            MelonCoroutines.Start(WaitThenSnapshot());
+        }
+
+        static IEnumerator WaitThenSnapshot()
+        {
+            yield return null;
+            yield return null;
+            yield return new WaitForSeconds(0.5f);
+            UndoMod.TakeInitialSnapshot();
         }
     }
 
@@ -108,10 +118,20 @@ namespace UndoMod
         static void Postfix(bool __result)
         {
             if (UndoMod.IsRestoring || !UndoMod.InCraftEditor || !__result) return;
+            // suppress Set* snapshots during part init, then take the real one
             UndoMod.UndoStack.Clear();
             UndoMod.CurrentIndex = -1;
-            UndoMod.CaptureRealPersistence();
-            UndoMod.TakeSnapshot("load");
+            UndoMod.InitialSnapshotDone = false;
+            UndoMod.SnapshotPending = false;
+            MelonCoroutines.Start(WaitThenSnapshot());
+        }
+
+        static IEnumerator WaitThenSnapshot()
+        {
+            yield return null;
+            yield return null;
+            yield return new WaitForSeconds(0.5f);
+            UndoMod.TakeInitialSnapshot();
         }
     }
 }

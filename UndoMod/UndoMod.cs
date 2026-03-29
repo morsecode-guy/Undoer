@@ -4,6 +4,7 @@ using System.Collections.Generic;
 using System.IO;
 using System.Linq;
 using System.Reflection;
+using System.Threading.Tasks;
 using MelonLoader;
 using HarmonyLib;
 using UnityEngine;
@@ -34,6 +35,8 @@ namespace UndoMod
         internal static bool IsRestoring;
         internal static bool InCraftEditor;
         internal static string ScratchDir; // single reusable temp folder for serialize/load
+        static string _scratchDirA, _scratchDirB; // two alternating dirs for background slurp
+        static bool _useScratchA = true;
         static bool _patchesDone;
 
         // the "real" persistence state — game's SerializeCraft and LoadCraft
@@ -49,10 +52,17 @@ namespace UndoMod
         // cooldown after restore so we dont snapshot the restore itself
         internal static float RestoreCooldownUntil;
 
+        // suppress Set* snapshots until the initial snapshot is done
+        // (parts fire Set* during loading which pollutes the stack)
+        internal static bool InitialSnapshotDone;
+
         // snapshot debounce
         internal static float LastSnapshotTime;
         internal static bool SnapshotPending;
         internal static float SnapshotDelay = 0.5f;
+
+        // background snapshot threading
+        static Task<UndoEntry> _bgTask;
 
         // undo memory config (F7 to cycle)
         static readonly int[] MemoryPresets = { 50, 100, 200, 500 };
@@ -65,6 +75,7 @@ namespace UndoMod
 
         // camera override — keeps camera still after restore
         internal static bool CameraOverrideActive;
+        static int _camOverrideFrames;
         static Vector3 _camPos;
         static Quaternion _camRot;
         static Vector3 _camPivot;
@@ -74,15 +85,22 @@ namespace UndoMod
 
         public override void OnInitializeMelon()
         {
-            ScratchDir = Path.Combine(
+            var baseDir = Path.Combine(
                 Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
-                "Flyout", "UndoMod", "scratch.craft");
+                "Flyout", "UndoMod");
 
-            if (Directory.Exists(ScratchDir))
-                Directory.Delete(ScratchDir, true);
+            _scratchDirA = Path.Combine(baseDir, "scratch_a.craft");
+            _scratchDirB = Path.Combine(baseDir, "scratch_b.craft");
+            ScratchDir = _scratchDirA;
 
-            Directory.CreateDirectory(ScratchDir);
-            LoggerInstance.Msg("Undoer ready  |  in-memory snapshots");
+            foreach (var d in new[] { _scratchDirA, _scratchDirB })
+            {
+                if (Directory.Exists(d))
+                    Directory.Delete(d, true);
+                Directory.CreateDirectory(d);
+            }
+
+            LoggerInstance.Msg("Undoer ready  |  in-memory snapshots (threaded)");
         }
 
         // --- scene tracking ---
@@ -121,10 +139,26 @@ namespace UndoMod
             if (!InCraftEditor) return;
 
             // flush pending snapshot after debounce
-            if (SnapshotPending && Time.time - LastSnapshotTime >= SnapshotDelay)
+            if (SnapshotPending && InitialSnapshotDone && Time.time - LastSnapshotTime >= SnapshotDelay)
             {
                 SnapshotPending = false;
                 TakeSnapshot("action");
+            }
+
+            // poll for completed background snapshot
+            if (_bgTask != null && _bgTask.IsCompleted)
+            {
+                try
+                {
+                    var entry = _bgTask.Result;
+                    if (entry != null)
+                        PushEntry(entry, "action");
+                }
+                catch (Exception ex)
+                {
+                    Melon<UndoMod>.Logger.Error($"Background snapshot failed: {ex}");
+                }
+                _bgTask = null;
             }
 
             // persistence guard: if the game drifted to our scratch dir, fix it
@@ -235,13 +269,63 @@ namespace UndoMod
         internal static void RequestSnapshot()
         {
             if (IsRestoring || Time.time < RestoreCooldownUntil) return;
+            if (!InitialSnapshotDone) return; // suppress during loading
             LastSnapshotTime = Time.time;
             SnapshotPending = true;
         }
 
-        // serialize the whole craft to disk, skipping png encoding
-        // for non-paint snapshots (reuses textures from prev entry)
+        // take a snapshot right now — called by structural operations
+        // (place, delete, duplicate, etc.) so the post-op state is always
+        // a separate undo step from any settings changes that follow
+        internal static void TakeSnapshotImmediate()
+        {
+            if (IsRestoring || Time.time < RestoreCooldownUntil) return;
+
+            // drain any in-flight background snapshot first
+            DrainBgTask();
+
+            // flush any pending debounced snapshot first (captures pre-op state)
+            if (SnapshotPending)
+            {
+                SnapshotPending = false;
+                TakeSnapshotSync("pre-action");
+            }
+
+            TakeSnapshotSync("action");
+        }
+
+        // serialize the whole craft to disk, then slurp into memory
+        // on a background thread so the main thread isn't blocked by I/O
         internal static void TakeSnapshot(string reason)
+        {
+            if (IsRestoring || Time.time < RestoreCooldownUntil) return;
+
+            var mgr = CEManager.instance;
+            if (mgr == null || mgr.craft == null) return;
+
+            // if a bg task is still running, wait for it first
+            DrainBgTask();
+
+            try
+            {
+                // --- main thread: serialize to disk ---
+                var serializeDir = SerializeToDisk(mgr, out var prevTex);
+                if (serializeDir == null) return;
+
+                // kick off background slurp
+                var capturedDir = serializeDir;
+                var capturedPrev = prevTex;
+                _bgTask = Task.Run(() => SlurpIntoEntry(capturedDir, capturedPrev));
+            }
+            catch (Exception ex)
+            {
+                Melon<UndoMod>.Logger.Error($"Snapshot failed: {ex}");
+            }
+        }
+
+        // synchronous version — used by TakeSnapshotImmediate where we
+        // need the entry on the stack before the next operation
+        static void TakeSnapshotSync(string reason)
         {
             if (IsRestoring || Time.time < RestoreCooldownUntil) return;
 
@@ -250,26 +334,12 @@ namespace UndoMod
 
             try
             {
-                var entry = TakeFullSnapshot(mgr);
-                if (entry == null) return;
+                var serializeDir = SerializeToDisk(mgr, out var prevTex);
+                if (serializeDir == null) return;
 
-                // trim redo history ahead of us
-                if (CurrentIndex < UndoStack.Count - 1)
-                    for (int i = UndoStack.Count - 1; i > CurrentIndex; i--)
-                        UndoStack.RemoveAt(i);
-
-                UndoStack.Add(entry);
-                CurrentIndex = UndoStack.Count - 1;
-
-                // cap stack size
-                while (UndoStack.Count > MaxUndoSteps)
-                {
-                    UndoStack.RemoveAt(0);
-                    CurrentIndex--;
-                }
-
-                Melon<UndoMod>.Logger.Msg(
-                    $"[{CurrentIndex}] {reason}  ({UndoStack.Count} in memory)");
+                var entry = SlurpIntoEntry(serializeDir, prevTex);
+                if (entry != null)
+                    PushEntry(entry, reason);
             }
             catch (Exception ex)
             {
@@ -277,9 +347,49 @@ namespace UndoMod
             }
         }
 
-        // full serialize via Persistence.SerializeCraft into the scratch
-        // folder, slurp everything into memory, then wipe the folder :3
-        static UndoEntry TakeFullSnapshot(CEManager mgr)
+        // add a completed entry to the undo stack
+        static void PushEntry(UndoEntry entry, string reason)
+        {
+            if (entry == null) return;
+
+            // trim redo history ahead of us
+            if (CurrentIndex < UndoStack.Count - 1)
+                for (int i = UndoStack.Count - 1; i > CurrentIndex; i--)
+                    UndoStack.RemoveAt(i);
+
+            UndoStack.Add(entry);
+            CurrentIndex = UndoStack.Count - 1;
+
+            // cap stack size
+            while (UndoStack.Count > MaxUndoSteps)
+            {
+                UndoStack.RemoveAt(0);
+                CurrentIndex--;
+            }
+
+            Melon<UndoMod>.Logger.Msg(
+                $"[{CurrentIndex}] {reason}  ({UndoStack.Count} in memory)");
+        }
+
+        // wait for any in-flight background task and push its result
+        static void DrainBgTask()
+        {
+            if (_bgTask == null) return;
+            try
+            {
+                var entry = _bgTask.Result; // blocks until done
+                if (entry != null)
+                    PushEntry(entry, "action");
+            }
+            catch (Exception ex)
+            {
+                Melon<UndoMod>.Logger.Error($"Background snapshot failed: {ex}");
+            }
+            _bgTask = null;
+        }
+
+        // main-thread part: serialize craft to disk, returns the scratch dir used
+        static string SerializeToDisk(CEManager mgr, out Dictionary<string, byte[]> prevTex)
         {
             string savedLoaded = _realPersistenceValid ? RealCurrentlyLoaded : Persistence.currentlyLoaded;
             bool savedTemp = _realPersistenceValid ? RealIsTemp : Persistence.isTemp;
@@ -290,8 +400,7 @@ namespace UndoMod
 
             bool isPaint = mgr.Mode == Il2CppCraftEditor.Mode.Paint;
 
-            // reuse prev entry's textures if we're not painting
-            Dictionary<string, byte[]> prevTex = null;
+            prevTex = null;
             if (!isPaint)
             {
                 for (int i = UndoStack.Count - 1; i >= 0; i--)
@@ -301,7 +410,6 @@ namespace UndoMod
                 }
             }
 
-            // fake hasBeenModified to skip expensive png encoding
             List<Paintable> modified = null;
             if (prevTex != null)
             {
@@ -318,21 +426,22 @@ namespace UndoMod
                 }
             }
 
-            // wipe scratch folder before writing
+            // pick which scratch dir to use (alternate so bg reads don't conflict)
+            string useDir = _useScratchA ? _scratchDirA : _scratchDirB;
+            _useScratchA = !_useScratchA;
+            ScratchDir = useDir; // restore also uses ScratchDir
             WipeScratch();
 
             try
             {
-                Persistence.SerializeCraft(mgr.craft, ScratchDir, true);
+                Persistence.SerializeCraft(mgr.craft, useDir, true);
             }
             finally
             {
-                // put hasBeenModified back
                 if (modified != null)
                     foreach (var p in modified)
                         p.hasBeenModified = true;
 
-                // put persistence back where it belongs
                 Persistence.currentlyLoaded = savedLoaded;
                 Persistence.isTemp = savedTemp;
                 Persistence.currentRootFolder = savedRoot;
@@ -341,28 +450,25 @@ namespace UndoMod
                 Persistence.savedTextureCount = savedTexCount;
             }
 
-            // slurp ALL files into memory
-            string dataFile = Path.Combine(ScratchDir, "data.txt");
-            if (!File.Exists(dataFile)) return null;
+            string dataFile = Path.Combine(useDir, "data.txt");
+            return File.Exists(dataFile) ? useDir : null;
+        }
 
+        // background-safe: reads files from disk into an UndoEntry
+        static UndoEntry SlurpIntoEntry(string scratchDir, Dictionary<string, byte[]> prevTex)
+        {
             var files = new Dictionary<string, byte[]>();
-            SlurpDirectory(ScratchDir, ScratchDir, files);
+            SlurpDirectory(scratchDir, scratchDir, files);
 
-            // figure out shared textures for this entry
-            // (either freshly encoded or reused from prev)
             var texFiles = new Dictionary<string, byte[]>();
             foreach (var kv in files)
                 if (kv.Key.StartsWith("Textures/") || kv.Key.StartsWith("Textures\\"))
                     texFiles[kv.Key] = kv.Value;
             var sharedTex = texFiles.Count > 0 ? texFiles : prevTex;
 
-            // if we skipped encoding, patch in the prev textures
             if (prevTex != null && texFiles.Count == 0)
                 foreach (var kv in prevTex)
                     files[kv.Key] = kv.Value;
-
-            // done with disk, wipe it
-            WipeScratch();
 
             return new UndoEntry
             {
@@ -418,24 +524,28 @@ namespace UndoMod
         // public version for patches to use
         internal static bool IsScratchPathPublic(string path) => IsScratchPath(path);
 
-        // grab initial snapshot when the stack is empty
+        // grab initial snapshot once loading is done
         internal static void TakeInitialSnapshot()
         {
-            if (UndoStack.Count == 0)
-            {
-                CaptureRealPersistence();
-                TakeSnapshot("initial");
-            }
+            // clear any garbage snapshots from Set* calls during loading
+            UndoStack.Clear();
+            CurrentIndex = -1;
+            SnapshotPending = false;
+            CaptureRealPersistence();
+            TakeSnapshot("initial");
+            InitialSnapshotDone = true;
         }
 
         // --- undo / redo ---
 
         void Undo()
         {
+            DrainBgTask();
+
             if (SnapshotPending)
             {
                 SnapshotPending = false;
-                TakeSnapshot("pre-undo");
+                TakeSnapshotSync("pre-undo");
             }
 
             if (CurrentIndex <= 0)
@@ -451,6 +561,8 @@ namespace UndoMod
 
         void Redo()
         {
+            DrainBgTask();
+
             if (CurrentIndex >= UndoStack.Count - 1)
             {
                 ShowStatus("Nothing to redo");
@@ -477,7 +589,11 @@ namespace UndoMod
                 bool prevSaveAs = _realPersistenceValid ? RealSaveAs : Persistence.saveAs;
                 bool prevIsAutoSave = _realPersistenceValid ? RealIsAutoSave : Persistence.isAutoSave;
                 int prevTexCount = _realPersistenceValid ? RealSavedTextureCount : Persistence.savedTextureCount;
-                Mode prevMode = mgr.Mode;
+
+                // close any open sub-editors before loading so they don't
+                // get stuck open after the craft is replaced
+                try { mgr.QuitCSE(); } catch { }
+                try { mgr.QuitWingEditor(); } catch { }
 
                 // save camera state before LoadCraft nukes it
                 var ceCam = mgr.camera;
@@ -512,6 +628,21 @@ namespace UndoMod
                         savedBlueprints.Add(lines);
                     }
                 }
+
+                // destroy any floating/picked parts so they dont survive the
+                // LoadCraft call (fixes subassembly undo leaving ghost parts)
+                try
+                {
+                    var floating = mgr.floatingParts;
+                    if (floating != null)
+                    {
+                        for (int i = floating.childCount - 1; i >= 0; i--)
+                            UnityEngine.Object.Destroy(floating.GetChild(i).gameObject);
+                    }
+                    mgr.pickedPart = null;
+                    mgr.pickedParts = null;
+                }
+                catch { }
 
                 // write all files from memory to scratch
                 WipeScratch();
@@ -553,6 +684,7 @@ namespace UndoMod
                     _camOrthoSize = savedOrthoSize;
                     _camOrthoZoom = savedOrthoZoom;
                     CameraOverrideActive = true;
+                    _camOverrideFrames = 3;
 
                     var cam2 = mgr.camera;
                     if (cam2 != null && cam2.camera != null)
@@ -574,9 +706,10 @@ namespace UndoMod
                     Persistence.isAutoSave = prevIsAutoSave;
                     Persistence.savedTextureCount = prevTexCount;
 
-                    // go back to paint mode if we were painting
-                    if (prevMode != Mode.Edit)
-                        MelonCoroutines.Start(DelayedModeRestore(prevMode));
+                    // force back to Edit mode so the user can select parts
+                    mgr.SetMode(Mode.Edit);
+                    mgr.Target = null;
+                    mgr.ClearOutlines();
                 }
                 else
                 {
@@ -601,17 +734,12 @@ namespace UndoMod
         {
             if (!CameraOverrideActive) return;
 
-            var mouse = Mouse.current;
-            if (mouse != null)
+            // only override for a few frames after restore, then stop
+            _camOverrideFrames--;
+            if (_camOverrideFrames <= 0)
             {
-                bool orbiting = mouse.rightButton.isPressed;
-                bool panning  = mouse.middleButton.isPressed;
-                bool zooming  = Mathf.Abs(mouse.scroll.ReadValue().y) > 0.01f;
-                if (orbiting || panning || zooming)
-                {
-                    CameraOverrideActive = false;
-                    return;
-                }
+                CameraOverrideActive = false;
+                return;
             }
 
             if (cam != null && cam.camera != null)
@@ -628,26 +756,16 @@ namespace UndoMod
 
         // --- helpers ---
 
-        static IEnumerator DelayedModeRestore(Mode targetMode)
-        {
-            yield return null;
-            yield return null;
-            yield return new WaitForSeconds(0.5f);
 
-            var mgr = CEManager.instance;
-            if (mgr != null)
-            {
-                mgr.SetMode(Mode.Edit);
-                mgr.SetMode(targetMode);
-            }
-        }
 
         void ClearHistory()
         {
+            DrainBgTask();
             UndoStack.Clear();
             CurrentIndex = -1;
             SnapshotPending = false;
             _realPersistenceValid = false;
+            InitialSnapshotDone = false;
         }
 
         // wipe and recreate the single scratch folder
@@ -670,6 +788,8 @@ namespace UndoMod
 
         // --- dynamic part module patching ---
 
+        // patches every Set* method on every PartModule subclass
+        // so literally any setting change is undoable :3
         void PatchPartModuleSetMethods()
         {
             var harmony = HarmonyInstance;
@@ -678,67 +798,148 @@ namespace UndoMod
                     nameof(GenericSetPostfix.Postfix),
                     BindingFlags.Public | BindingFlags.Static));
 
-            var targets = new Dictionary<Type, string[]>
-            {
-                { typeof(DrumMagazine),     new[] { "SetRows", "SetCaliber" } },
-                { typeof(PGun),             new[] { "SetBarrelCount", "SetBarrelLength", "SetCaliber", "SetRpm" } },
-                { typeof(PMunition),        new[] { "SetRadius", "SetDiameter", "SetNoseCone", "SetNoseConeAspect",
-                                                    "SetGuidance", "SetGuidanceAspect", "SetPayload", "SetPayloadAspect",
-                                                    "SetFuelTank", "SetFuelTankAspect", "SetMotor", "SetDetonator" } },
-                { typeof(FuelTank),         new[] { "SetFill", "SetFuelSystem", "SetPriority", "SetFuel" } },
-                { typeof(Controller),       new[] { "SetResponsiveness", "SetMin", "SetMax", "SetOffset", "SetMachResp" } },
-                { typeof(Connector),        new[] { "SetForce" } },
-                { typeof(LandingGear),      new[] { "SetPower", "SetSteerAngle", "SetBrakeTorque", "SetWheelHeight" } },
-                { typeof(ProceduralEngine), new[] { "SetArrangement", "SetRows", "SetCylindersPerBank", "SetBore",
-                                                    "SetStroke", "SetCpr", "SetValveCount", "SetValveDiameter",
-                                                    "SetScale", "SetIdleThrottle", "SetAFR", "SetRpmLimit",
-                                                    "SetTurbo", "SetSuper", "SetTurboPrat", "SetSuperPrat",
-                                                    "SetSuperAlt", "SetSuperGearKey" } },
-                { typeof(ProceduralProp),   new[] { "SetPusher", "SetBladeCount", "SetBladeLength", "SetBladeChord",
-                                                    "SetBladeTwist", "SetScale", "SetDirection", "SetConstantSpeedMode",
-                                                    "SetConstantRPM", "SetConstantSpring", "SetConstantPow",
-                                                    "SetConstantMach", "SetPitch", "SetRangeMin", "SetRangeMax" } },
-                { typeof(ProceduralLG),     new[] { "SetWheelSetup", "SetBrakeSteering", "SetWheelSize", "SetScale", "SetLength" } },
-                { typeof(DuctedFan),        new[] { "SetDiameter", "SetBladeAngle" } },
-                { typeof(ElectricMotor),    new[] { "SetRadius", "SetLength", "SetTorque", "SetMaxRPM" } },
-                { typeof(BleedAirNozzle),   new[] { "SetRadius", "SetConeRadius", "SetPosition", "SetLength" } },
-                { typeof(CoveredWheel),     new[] { "SetRadius", "SetWidth", "SetBrakeForce" } },
-                { typeof(DropTank),         new[] { "SetLength", "SetFrontCone", "SetRearCone" } },
-                { typeof(GeneralLight),     new[] { "SetPower", "SetAngle" } },
-                { typeof(NavLight),         new[] { "SetPower" } },
-                { typeof(LiftFan),          new[] { "SetDiameter" } },
-                { typeof(Parachute),        new[] { "SetRadius", "SetRopeLength", "SetDelay" } },
-                { typeof(Paintable),        new[] { "SetResolution" } },
-                { typeof(ImportSettings),   new[] { "SetMass", "SetMirror", "SetCollision", "SetDrag" } },
-                { typeof(ExhaustEffect),    new[] { "SetEngine", "SetExhaustCount" } },
-                { typeof(Gear),             new[] { "SetGearCount", "SetGear", "SetGearRatio", "SetUpKey", "SetDownKey" } },
+            // skip methods that arent editor settings — runtime/physics/loading stuff
+            var skipSuffixes = new[] {
+                "NextFrame", "Internal", "Velocity", "Transform", "Mesh",
+                "Vertices", "Connected", "OnFire", "Master", "Parent",
+                "Previous", "AsRoot", "Effects", "Preview", "CircuitEnergy",
+                "Collider", "MirrorHandles", "MirrorHandlePositions",
+                "Script", "Clip",
             };
+
+            // find the PartModule base type from the game assembly
+            var partModuleType = typeof(Il2Cpp.FuelTank).BaseType; // PartModule
+
+            // only scan the game assembly, not everything in the appdomain
+            var gameAsm = partModuleType.Assembly;
+            Type[] allTypes;
+            try { allTypes = gameAsm.GetTypes(); }
+            catch { LoggerInstance.Error("Cant get types from game assembly"); return; }
 
             int ok = 0, fail = 0;
 
-            foreach (var (type, methods) in targets)
-            foreach (var name in methods)
+            foreach (var type in allTypes)
             {
+                if (type.IsAbstract || type.IsGenericType) continue;
+
+                // must inherit from PartModule (directly or indirectly)
+                bool isPartModule = false;
                 try
                 {
-                    var found = type
-                        .GetMethods(BindingFlags.Public | BindingFlags.Instance | BindingFlags.DeclaredOnly)
-                        .Where(m => m.Name == name && !m.IsAbstract && !m.IsGenericMethod);
+                    var bt = type.BaseType;
+                    while (bt != null)
+                    {
+                        if (bt == partModuleType) { isPartModule = true; break; }
+                        bt = bt.BaseType;
+                    }
+                }
+                catch { continue; }
 
-                    foreach (var m in found)
+                if (!isPartModule) continue;
+
+                PatchSetMethods(harmony, postfix, type, skipSuffixes, ref ok, ref fail);
+            }
+
+            // also patch types that arent PartModules but have editor settings
+            var extraTypes = new Type[]
+            {
+                typeof(Il2Cpp.PartMaterials),
+                typeof(Il2Cpp.EditableFuselage),
+                typeof(Il2Cpp.ProcWing2),
+                typeof(Il2Cpp.WingEdge),
+                typeof(Il2Cpp.EditableRotor),
+                typeof(Il2Cpp.CustomAxis),
+            };
+
+            foreach (var type in extraTypes)
+                PatchSetMethods(harmony, postfix, type, skipSuffixes, ref ok, ref fail);
+
+            // patch Select* methods on ProceduralProp (blade/cone type switching
+            // uses "Select" prefix instead of "Set")
+            try
+            {
+                var propType = typeof(Il2Cpp.ProceduralProp);
+                foreach (var name in new[] { "SelectBlade", "SelectCone" })
+                {
+                    var m = propType.GetMethod(name, BindingFlags.Public | BindingFlags.Instance);
+                    if (m != null)
+                    {
+                        try { harmony.Patch(m, postfix: postfix); ok++; }
+                        catch { fail++; }
+                    }
+                }
+            }
+            catch { }
+
+            // patch GunSolver property setters for tracer rate and muzzle velocity
+            // (these have no Set* wrappers — CannonPanel sets them via property setters)
+            try
+            {
+                var gunSolverType = typeof(Il2Cpp.GunSolver);
+                foreach (var propName in new[] { "tracerRate", "muzzleVelocity" })
+                {
+                    var prop = gunSolverType.GetProperty(propName, BindingFlags.Public | BindingFlags.Instance);
+                    if (prop?.SetMethod != null)
+                    {
+                        try { harmony.Patch(prop.SetMethod, postfix: postfix); ok++; }
+                        catch { fail++; }
+                    }
+                }
+            }
+            catch { }
+
+            // patch SmokeEmitter property setters — has zero Set* methods
+            // color changes are handled by SmokeEmitterPanel.SetColor patch,
+            // but rate is set directly via property setter from slider closure
+            try
+            {
+                var smokeType = typeof(Il2Cpp.SmokeEmitter);
+                foreach (var propName in new[] { "color", "rate" })
+                {
+                    var prop = smokeType.GetProperty(propName, BindingFlags.Public | BindingFlags.Instance);
+                    if (prop?.SetMethod != null)
+                    {
+                        try { harmony.Patch(prop.SetMethod, postfix: postfix); ok++; }
+                        catch { fail++; }
+                    }
+                }
+            }
+            catch { }
+
+            LoggerInstance.Msg($"Patched {ok} part module Set methods ({fail} failed)");
+        }
+
+        void PatchSetMethods(HarmonyLib.Harmony harmony, HarmonyMethod postfix,
+            Type type, string[] skipSuffixes, ref int ok, ref int fail)
+        {
+            try
+            {
+                var methods = type
+                    .GetMethods(BindingFlags.Public | BindingFlags.Instance | BindingFlags.DeclaredOnly)
+                    .Where(m => m.Name.StartsWith("Set") && !m.IsAbstract && !m.IsGenericMethod);
+
+                foreach (var m in methods)
+                {
+                    // skip runtime/loading methods
+                    bool skip = false;
+                    foreach (var suffix in skipSuffixes)
+                        if (m.Name.Length > 3 && m.Name.Substring(3).Contains(suffix))
+                        { skip = true; break; }
+                    if (skip) continue;
+
+                    try
                     {
                         harmony.Patch(m, postfix: postfix);
                         ok++;
                     }
-                }
-                catch (Exception ex)
-                {
-                    LoggerInstance.Warning($"Cant patch {type.Name}.{name}: {ex.Message}");
-                    fail++;
+                    catch (Exception ex)
+                    {
+                        LoggerInstance.Warning($"Cant patch {type.Name}.{m.Name}: {ex.Message}");
+                        fail++;
+                    }
                 }
             }
-
-            LoggerInstance.Msg($"Patched {ok} part module Set methods ({fail} failed)");
+            catch { }
         }
     }
 }
