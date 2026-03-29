@@ -4,7 +4,7 @@ using Il2Cpp;
 
 namespace UndoMod
 {
-    // part operations
+    // part operations :3
 
     [HarmonyPatch(typeof(CEManager), nameof(CEManager.DeletePart))]
     static class Patch_Delete { static void Postfix() => SnapHelper.Do(); }

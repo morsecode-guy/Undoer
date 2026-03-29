@@ -11,36 +11,23 @@ using UnityEngine.InputSystem;
 using Il2CppCraftEditor;
 using Il2Cpp;
 
-[assembly: MelonInfo(typeof(UndoMod.UndoMod), "Undoer", "2.2.0", "Morse Code Guy")]
+[assembly: MelonInfo(typeof(UndoMod.UndoMod), "Undoer", "2.3.0", "Morse Code Guy")]
 [assembly: MelonGame("Stonext Games", "Flyout")]
 
 namespace UndoMod
 {
-    // ---------------------------------------------------------------
-    // Undo entry — holds complete craft state either on disk or in
-    // memory. Every entry stores the full data.txt text so we never
-    // need to reconstruct state from deltas.
-    // ---------------------------------------------------------------
-
+    // one undo/redo entry — full craft state on disk
     internal class UndoEntry
     {
-        /// <summary>Path to the .craft folder on disk (data.txt, meta.txt, Textures/)</summary>
+        // path to the .craft folder (has data.txt, meta.txt, Textures/)
         public string DiskFolder;
 
-        /// <summary>
-        /// Path to a Textures folder on disk. Shared between entries
-        /// that don't change paint. Null when no paint data exists.
-        /// </summary>
+        // shared texture folder, null if no paint data
         public string TexturePath;
     }
 
-    // ---------------------------------------------------------------
-    // Main mod class
-    // ---------------------------------------------------------------
-
     public class UndoMod : MelonMod
     {
-        // state
         internal static readonly List<UndoEntry> UndoStack = new();
         internal static int CurrentIndex = -1;
         internal static bool IsRestoring;
@@ -48,7 +35,14 @@ namespace UndoMod
         internal static string UndoTempDir;
         static bool _patchesDone;
 
-        // cooldown after restore to suppress spurious callbacks
+        // the "real" persistence state — game's SerializeCraft and LoadCraft
+        // both overwrite these to our temp dir, so we track + restore them :)
+        internal static string RealCurrentlyLoaded;
+        internal static bool RealIsTemp;
+        internal static string RealCurrentRootFolder;
+        static bool _realPersistenceValid;
+
+        // cooldown after restore so we dont snapshot the restore itself
         internal static float RestoreCooldownUntil;
 
         // snapshot debounce
@@ -56,25 +50,23 @@ namespace UndoMod
         internal static bool SnapshotPending;
         internal static float SnapshotDelay = 0.5f;
 
-        // config
+        // undo memory config (F7 to cycle)
         static readonly int[] MemoryPresets = { 50, 100, 200, 500 };
         static int _presetIndex = 2;
         static int MaxUndoSteps => MemoryPresets[_presetIndex];
 
-        // hud
+        // hud toast
         static string _statusText = "";
         static float _statusTimer;
 
-        // camera override after restore
+        // camera override — keeps camera still after restore
         internal static bool CameraOverrideActive;
         static Vector3 _camPos;
         static Quaternion _camRot;
         static Vector3 _camPivot;
         static float _camZoom, _camOrthoSize, _camOrthoZoom;
 
-        // -----------------------------------------------------------
-        // init
-        // -----------------------------------------------------------
+        // --- init ---
 
         public override void OnInitializeMelon()
         {
@@ -89,9 +81,7 @@ namespace UndoMod
             LoggerInstance.Msg("Undoer ready  |  temp: " + UndoTempDir);
         }
 
-        // -----------------------------------------------------------
-        // scene tracking
-        // -----------------------------------------------------------
+        // --- scene tracking ---
 
         public override void OnSceneWasLoaded(int buildIndex, string sceneName)
         {
@@ -116,11 +106,9 @@ namespace UndoMod
             }
         }
 
-        // -----------------------------------------------------------
-        // per-frame update
-        // -----------------------------------------------------------
+        // --- per-frame update ---
 
-        // paint stroke tracking via mouse release in paint mode
+        // paint stroke tracking
         static bool _wasMouseDown;
         static bool _mouseDownOnUI;
 
@@ -135,7 +123,23 @@ namespace UndoMod
                 TakeSnapshot("action");
             }
 
-            // detect paint stroke end: mouse released in paint mode
+            // persistence guard: if the game drifted to our temp dir, fix it
+            if (_realPersistenceValid && !IsRestoring)
+            {
+                var cl = Persistence.currentlyLoaded;
+                if (IsUndoTempPath(cl))
+                {
+                    Persistence.currentlyLoaded = RealCurrentlyLoaded;
+                    Persistence.isTemp = RealIsTemp;
+                    Persistence.currentRootFolder = RealCurrentRootFolder;
+                }
+                else if (cl != null && cl != RealCurrentlyLoaded)
+                {
+                    CaptureRealPersistence();
+                }
+            }
+
+            // detect paint strokes ending (mouse release in paint mode)
             bool inPaintMode = CEManager.instance != null
                 && CEManager.instance.Mode == Il2CppCraftEditor.Mode.Paint;
 
@@ -150,7 +154,7 @@ namespace UndoMod
                     _mouseDownOnUI = es != null && es.IsPointerOverGameObject();
                 }
 
-                // paint strokes need full serialize for textures
+                // paint needs full serialize for the textures
                 if (_wasMouseDown && !mouseDown && !_mouseDownOnUI)
                     RequestSnapshot();
 
@@ -191,9 +195,7 @@ namespace UndoMod
             }
         }
 
-        // -----------------------------------------------------------
-        // hud overlay
-        // -----------------------------------------------------------
+        // --- hud overlay ---
 
         public override void OnGUI()
         {
@@ -220,13 +222,9 @@ namespace UndoMod
             GUI.color = Color.white;
         }
 
-        // -----------------------------------------------------------
-        // snapshot management
-        // -----------------------------------------------------------
+        // --- snapshots ---
 
-        /// <summary>
-        /// Queue a debounced snapshot.
-        /// </summary>
+        // queue a debounced snapshot
         internal static void RequestSnapshot()
         {
             if (IsRestoring || Time.time < RestoreCooldownUntil) return;
@@ -234,11 +232,8 @@ namespace UndoMod
             SnapshotPending = true;
         }
 
-        /// <summary>
-        /// Serialize the entire craft to disk using Persistence.SerializeCraft.
-        /// Uses the hasBeenModified trick to skip PNG encoding for non-paint
-        /// snapshots and copies textures from the previous entry instead.
-        /// </summary>
+        // serialize the whole craft to disk, skipping png encoding
+        // for non-paint snapshots (reuses textures from prev entry)
         internal static void TakeSnapshot(string reason)
         {
             if (IsRestoring || Time.time < RestoreCooldownUntil) return;
@@ -251,7 +246,7 @@ namespace UndoMod
                 var entry = TakeFullSnapshot(mgr);
                 if (entry == null) return;
 
-                // trim redo history
+                // trim redo history ahead of us
                 if (CurrentIndex < UndoStack.Count - 1)
                     for (int i = UndoStack.Count - 1; i > CurrentIndex; i--)
                     {
@@ -262,7 +257,7 @@ namespace UndoMod
                 UndoStack.Add(entry);
                 CurrentIndex = UndoStack.Count - 1;
 
-                // cap size
+                // cap stack size
                 while (UndoStack.Count > MaxUndoSteps)
                 {
                     CleanupEntry(UndoStack[0]);
@@ -279,24 +274,21 @@ namespace UndoMod
             }
         }
 
-        /// <summary>
-        /// Full serialization via Persistence.SerializeCraft.
-        /// Creates a .craft folder on disk with data.txt + Textures/.
-        /// Uses the hasBeenModified trick: for non-paint snapshots
-        /// we skip PNG encoding and copy textures from the previous entry.
-        /// </summary>
+        // full serialize via Persistence.SerializeCraft
+        // hasBeenModified trick: skip png encoding when not painting
+        // and just copy textures from prev entry instead :3
         static UndoEntry TakeFullSnapshot(CEManager mgr)
         {
-            string savedLoaded = Persistence.currentlyLoaded;
-            bool savedTemp = Persistence.isTemp;
-            string savedRoot = Persistence.currentRootFolder;
+            string savedLoaded = _realPersistenceValid ? RealCurrentlyLoaded : Persistence.currentlyLoaded;
+            bool savedTemp = _realPersistenceValid ? RealIsTemp : Persistence.isTemp;
+            string savedRoot = _realPersistenceValid ? RealCurrentRootFolder : Persistence.currentRootFolder;
 
             string name = $"undo_{DateTime.Now:yyyyMMdd_HHmmss_fff}.craft";
             string path = Path.Combine(UndoTempDir, name);
 
             bool isPaint = mgr.Mode == Il2CppCraftEditor.Mode.Paint;
 
-            // find previous entry's texture folder for reuse
+            // reuse prev entry's textures if we're not painting
             string prevTexDir = null;
             if (!isPaint)
             {
@@ -308,7 +300,7 @@ namespace UndoMod
                 }
             }
 
-            // temporarily suppress PNG encoding for non-paint snapshots
+            // fake hasBeenModified to skip expensive png encoding
             List<Paintable> modified = null;
             if (prevTexDir != null)
             {
@@ -331,18 +323,18 @@ namespace UndoMod
             }
             finally
             {
-                // restore hasBeenModified flags
+                // put hasBeenModified back
                 if (modified != null)
                     foreach (var p in modified)
                         p.hasBeenModified = true;
 
-                // restore persistence state
+                // put persistence back where it belongs
                 Persistence.currentlyLoaded = savedLoaded;
                 Persistence.isTemp = savedTemp;
                 Persistence.currentRootFolder = savedRoot;
             }
 
-            // copy textures from previous snapshot if we skipped PNGs
+            // copy textures from prev if we skipped encoding
             if (prevTexDir != null)
             {
                 string newTexDir = Path.Combine(path, "Textures");
@@ -354,7 +346,7 @@ namespace UndoMod
             string dataFile = Path.Combine(path, "data.txt");
             if (!File.Exists(dataFile)) return null;
 
-            // figure out texture path for this entry
+            // figure out which texture folder this entry gets
             string texDir2 = Path.Combine(path, "Textures");
             string texPath = Directory.Exists(texDir2) &&
                              Directory.GetFiles(texDir2).Length > 0
@@ -368,16 +360,33 @@ namespace UndoMod
             };
         }
 
-        // take one snapshot if there is nothing in the stack yet
+        // capture the real craft path so we can restore it later
+        internal static void CaptureRealPersistence()
+        {
+            RealCurrentlyLoaded = Persistence.currentlyLoaded;
+            RealIsTemp = Persistence.isTemp;
+            RealCurrentRootFolder = Persistence.currentRootFolder;
+            _realPersistenceValid = true;
+            Melon<UndoMod>.Logger.Msg($"Real persistence: {RealCurrentlyLoaded}");
+        }
+
+        static bool IsUndoTempPath(string path)
+        {
+            if (string.IsNullOrEmpty(path) || string.IsNullOrEmpty(UndoTempDir)) return false;
+            return path.Replace('\\', '/').StartsWith(UndoTempDir.Replace('\\', '/'));
+        }
+
+        // grab initial snapshot when the stack is empty
         internal static void TakeInitialSnapshot()
         {
             if (UndoStack.Count == 0)
+            {
+                CaptureRealPersistence();
                 TakeSnapshot("initial");
+            }
         }
 
-        // -----------------------------------------------------------
-        // undo / redo
-        // -----------------------------------------------------------
+        // --- undo / redo ---
 
         void Undo()
         {
@@ -426,12 +435,12 @@ namespace UndoMod
             {
                 IsRestoring = true;
 
-                string prevLoaded = Persistence.currentlyLoaded;
-                bool prevTemp = Persistence.isTemp;
-                string prevRoot = Persistence.currentRootFolder;
+                string prevLoaded = _realPersistenceValid ? RealCurrentlyLoaded : Persistence.currentlyLoaded;
+                bool prevTemp = _realPersistenceValid ? RealIsTemp : Persistence.isTemp;
+                string prevRoot = _realPersistenceValid ? RealCurrentRootFolder : Persistence.currentRootFolder;
                 Mode prevMode = mgr.Mode;
 
-                // save camera state
+                // save camera state before LoadCraft nukes it
                 var ceCam = mgr.camera;
                 Vector3 savedPos = Vector3.zero;
                 Quaternion savedRot = Quaternion.identity;
@@ -454,7 +463,7 @@ namespace UndoMod
                 {
                     LoggerInstance.Msg($"Restored snapshot {CurrentIndex}");
 
-                    // camera override
+                    // keep the camera where it was
                     _camPos = savedPos;
                     _camRot = savedRot;
                     _camPivot = savedPivot;
@@ -475,12 +484,12 @@ namespace UndoMod
                         cam2.ResetVelocity();
                     }
 
-                    // restore persistence
+                    // fix persistence so saves go to the right place
                     Persistence.currentlyLoaded = prevLoaded;
                     Persistence.isTemp = prevTemp;
                     Persistence.currentRootFolder = prevRoot;
 
-                    // delayed mode restore for paint
+                    // go back to paint mode if we were painting
                     if (prevMode != Mode.Edit)
                         MelonCoroutines.Start(DelayedModeRestore(prevMode));
                 }
@@ -501,9 +510,7 @@ namespace UndoMod
             }
         }
 
-        // -----------------------------------------------------------
-        // camera override (postfix on CECamera.LateUpdate)
-        // -----------------------------------------------------------
+        // --- camera override (postfix on CECamera.LateUpdate) ---
 
         internal static void ApplyCameraOverride(CECamera cam)
         {
@@ -534,9 +541,7 @@ namespace UndoMod
             }
         }
 
-        // -----------------------------------------------------------
-        // helpers
-        // -----------------------------------------------------------
+        // --- helpers ---
 
         static IEnumerator DelayedModeRestore(Mode targetMode)
         {
@@ -558,6 +563,7 @@ namespace UndoMod
             UndoStack.Clear();
             CurrentIndex = -1;
             SnapshotPending = false;
+            _realPersistenceValid = false;
         }
 
         static void CleanupEntry(UndoEntry entry)
@@ -579,9 +585,7 @@ namespace UndoMod
             _statusTimer = 1.8f;
         }
 
-        // -----------------------------------------------------------
-        // dynamic part module patching
-        // -----------------------------------------------------------
+        // --- dynamic part module patching ---
 
         void PatchPartModuleSetMethods()
         {

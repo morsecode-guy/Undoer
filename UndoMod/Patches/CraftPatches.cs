@@ -6,7 +6,7 @@ using Il2CppCraftEditor;
 
 namespace UndoMod
 {
-    // take initial snapshot after the editor finishes loading
+    // grab initial snapshot after the editor finishes loading
     [HarmonyPatch(typeof(CEManager), nameof(CEManager.Start))]
     static class Patch_Start
     {
@@ -25,7 +25,7 @@ namespace UndoMod
         }
     }
 
-    // new craft just resets history, no snapshot needed
+    // new craft resets history, fresh start :)
     [HarmonyPatch(typeof(CEManager), nameof(CEManager.NewCraft))]
     static class Patch_NewCraft
     {
@@ -35,10 +35,11 @@ namespace UndoMod
             UndoMod.UndoStack.Clear();
             UndoMod.CurrentIndex = -1;
             UndoMod.SnapshotPending = false;
+            UndoMod.CaptureRealPersistence();
         }
     }
 
-    // loading a craft resets history and takes a fresh snapshot
+    // loading a craft resets history and snapshots the fresh state
     [HarmonyPatch(typeof(CEManager), nameof(CEManager.LoadCraft), typeof(string))]
     static class Patch_LoadCraft
     {
@@ -47,6 +48,7 @@ namespace UndoMod
             if (UndoMod.IsRestoring || !UndoMod.InCraftEditor || !__result) return;
             UndoMod.UndoStack.Clear();
             UndoMod.CurrentIndex = -1;
+            UndoMod.CaptureRealPersistence();
             UndoMod.TakeSnapshot("load");
         }
     }

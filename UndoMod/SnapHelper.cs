@@ -1,6 +1,6 @@
 namespace UndoMod
 {
-    // shared postfix for all harmony patches - queues a debounced snapshot
+    // shared postfix for harmony patches — queues a debounced snapshot
     static class SnapHelper
     {
         public static void Do()
@@ -11,7 +11,7 @@ namespace UndoMod
         }
     }
 
-    // catch-all postfix for dynamically patched part module Set methods
+    // catch-all postfix for dynamically patched Set methods on part modules
     internal static class GenericSetPostfix
     {
         public static void Postfix()

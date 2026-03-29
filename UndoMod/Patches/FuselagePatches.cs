@@ -6,7 +6,7 @@ using UnityEngine.InputSystem;
 
 namespace UndoMod
 {
-    // fuselage edits
+    // fuselage edits :3
 
     [HarmonyPatch(typeof(EditableFuselage), nameof(EditableFuselage.ApplyChanges))]
     static class Patch_FusApply { static void Postfix() => SnapHelper.Do(); }
@@ -29,7 +29,7 @@ namespace UndoMod
     [HarmonyPatch(typeof(EditableFuselage), nameof(EditableFuselage.ApplyMaterials))]
     static class Patch_FusMat { static void Postfix() => SnapHelper.Do(); }
 
-    // cross section editor
+    // cross section editor stuff
 
     [HarmonyPatch(typeof(CrossSectionEditor), nameof(CrossSectionEditor.Close))]
     static class Patch_CSEClose { static void Postfix() => SnapHelper.Do(); }
@@ -40,9 +40,9 @@ namespace UndoMod
     [HarmonyPatch(typeof(CEManager), nameof(CEManager.QuitCSE))]
     static class Patch_QuitCSE { static void Postfix() => SnapHelper.Do(); }
 
-    // suppress TexturePaintMode.Update() only on the exact frame
-    // Ctrl+Z or Ctrl+Y is pressed, so the Z key doesnt rotate the
-    // brush. Skipping Update for the entire Ctrl hold breaks painting.
+    // skip TexturePaintMode.Update on the exact frame ctrl+z/y is pressed
+    // so the z key doesnt rotate the brush
+    // only skip that one frame tho, holding ctrl is fine for painting
     [HarmonyPatch(typeof(TexturePaintMode), nameof(TexturePaintMode.Update))]
     static class Patch_PaintModeUpdate
     {
@@ -57,9 +57,8 @@ namespace UndoMod
         }
     }
 
-    // Harmony POSTFIX on CECamera.LateUpdate — runs AFTER the game
-    // finishes computing camera position/rotation, so we can
-    // overwrite with saved values and it actually sticks.
+    // camera override postfix — runs after the game computes camera
+    // so our saved position actually sticks :)
     [HarmonyPatch(typeof(CECamera), nameof(CECamera.LateUpdate))]
     static class Patch_CECamLateUpdate
     {

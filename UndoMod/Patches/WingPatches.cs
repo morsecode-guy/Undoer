@@ -4,7 +4,7 @@ using Il2Cpp;
 
 namespace UndoMod
 {
-    // wing property edits
+    // wing property edits :3
 
     [HarmonyPatch(typeof(ProcWing2), nameof(ProcWing2.SetSpan))]
     static class Patch_WSpan { static void Postfix() => SnapHelper.Do(); }

@@ -4,7 +4,7 @@ using Il2Cpp;
 
 namespace UndoMod
 {
-    // material and paint changes
+    // material and paint stuff
 
     [HarmonyPatch(typeof(PartMaterials), nameof(PartMaterials.SetMaterial))]
     static class Patch_SetMat { static void Postfix() => SnapHelper.Do(); }
