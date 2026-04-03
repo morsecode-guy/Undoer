@@ -12,7 +12,7 @@ using UnityEngine.InputSystem;
 using Il2CppCraftEditor;
 using Il2Cpp;
 
-[assembly: MelonInfo(typeof(UndoMod.UndoMod), "Undoer", "3.0.0", "Morse Code Guy")]
+[assembly: MelonInfo(typeof(UndoMod.UndoMod), "Undoer", "3.4.0", "Morse Code Guy")]
 [assembly: MelonGame("Stonext Games", "Flyout")]
 
 namespace UndoMod
@@ -33,6 +33,7 @@ namespace UndoMod
         internal static readonly List<UndoEntry> UndoStack = new();
         internal static int CurrentIndex = -1;
         internal static bool IsRestoring;
+        internal static bool IsSnapshotting; // true while our SerializeToDisk runs
         internal static bool InCraftEditor;
         internal static string ScratchDir; // single reusable temp folder for serialize/load
         static string _scratchDirA, _scratchDirB; // two alternating dirs for background slurp
@@ -51,6 +52,10 @@ namespace UndoMod
 
         // cooldown after restore so we dont snapshot the restore itself
         internal static float RestoreCooldownUntil;
+
+        // after a restore, force persistence back to real values every frame
+        // for a few seconds so no game callback can corrupt the save path
+        static float _restoreGuardUntil;
 
         // suppress Set* snapshots until the initial snapshot is done
         // (parts fire Set* during loading which pollutes the stack)
@@ -162,21 +167,18 @@ namespace UndoMod
             }
 
             // persistence guard: if the game drifted to our scratch dir, fix it
+            // after a restore, force persistence back every frame for a few seconds
             if (_realPersistenceValid && !IsRestoring)
             {
-                var cl = Persistence.currentlyLoaded;
-                if (IsScratchPath(cl))
+                if (Time.time < _restoreGuardUntil)
                 {
-                    Persistence.currentlyLoaded = RealCurrentlyLoaded;
-                    Persistence.isTemp = RealIsTemp;
-                    Persistence.currentRootFolder = RealCurrentRootFolder;
-                    Persistence.saveAs = RealSaveAs;
-                    Persistence.isAutoSave = RealIsAutoSave;
-                    Persistence.savedTextureCount = RealSavedTextureCount;
+                    ForceRealPersistence();
                 }
-                else if (cl != null && cl != RealCurrentlyLoaded)
+                else
                 {
-                    CaptureRealPersistence();
+                    var cl = Persistence.currentlyLoaded;
+                    if (IsScratchPath(cl))
+                        ForceRealPersistence();
                 }
             }
 
@@ -434,10 +436,12 @@ namespace UndoMod
 
             try
             {
+                IsSnapshotting = true;
                 Persistence.SerializeCraft(mgr.craft, useDir, true);
             }
             finally
             {
+                IsSnapshotting = false;
                 if (modified != null)
                     foreach (var p in modified)
                         p.hasBeenModified = true;
@@ -514,11 +518,26 @@ namespace UndoMod
             Persistence.savedTextureCount = RealSavedTextureCount;
         }
 
+        // get the real craft folder path (directory of the data.txt file)
+        internal static string GetRealCraftFolder()
+        {
+            if (!_realPersistenceValid || string.IsNullOrEmpty(RealCurrentlyLoaded))
+                return null;
+            return Path.GetDirectoryName(RealCurrentlyLoaded);
+        }
+
+        // stop the post-restore guard so saves/loads can update persistence
+        internal static void ClearRestoreGuard()
+        {
+            _restoreGuardUntil = 0;
+        }
+
         static bool IsScratchPath(string path)
         {
             if (string.IsNullOrEmpty(path) || string.IsNullOrEmpty(ScratchDir)) return false;
             var parent = Path.GetDirectoryName(ScratchDir);
-            return path.Replace('\\', '/').StartsWith(parent.Replace('\\', '/'));
+            return path.Replace('\\', '/').StartsWith(
+                parent.Replace('\\', '/'), StringComparison.OrdinalIgnoreCase);
         }
 
         // public version for patches to use
@@ -655,6 +674,29 @@ namespace UndoMod
                     File.WriteAllBytes(dest, kv.Value);
                 }
 
+                // save craft metadata before LoadCraft replaces it with
+                // scratch values (favourite, build time, launch stats, etc.)
+                bool savedFavorite = false;
+                string savedMetaName = null;
+                string savedMetaRoot = null;
+                string savedVersion = null;
+                int savedTimesLoaded = 0, savedTimesLaunched = 0;
+                float savedFlyingTime = 0f;
+                double savedBuildTime = 0;
+                bool hasMeta = mgr.craft != null && mgr.craft.meta != null;
+                if (hasMeta)
+                {
+                    var m = mgr.craft.meta;
+                    savedFavorite = m.favorite;
+                    savedMetaName = m.name;
+                    savedMetaRoot = m.rootPath;
+                    savedVersion = m.version;
+                    savedTimesLoaded = m.timesLoaded;
+                    savedTimesLaunched = m.timesLaunched;
+                    savedFlyingTime = m.flyingTime;
+                    savedBuildTime = m.buildTime;
+                }
+
                 bool ok = mgr.LoadCraft(Path.Combine(ScratchDir, "data.txt"));
 
                 // dont wipe scratch here — game may load images async
@@ -663,6 +705,20 @@ namespace UndoMod
                 if (ok)
                 {
                     LoggerInstance.Msg($"Restored snapshot {CurrentIndex}");
+
+                    // restore craft metadata that LoadCraft overwrote
+                    if (hasMeta && mgr.craft != null && mgr.craft.meta != null)
+                    {
+                        var m = mgr.craft.meta;
+                        m.favorite = savedFavorite;
+                        m.name = savedMetaName;
+                        m.rootPath = savedMetaRoot;
+                        m.version = savedVersion;
+                        m.timesLoaded = savedTimesLoaded;
+                        m.timesLaunched = savedTimesLaunched;
+                        m.flyingTime = savedFlyingTime;
+                        m.buildTime = savedBuildTime;
+                    }
 
                     // restore blueprints — LoadCraft wipes them but they're
                     // not part of the craft data, they're a separate system
@@ -684,11 +740,14 @@ namespace UndoMod
                     _camOrthoSize = savedOrthoSize;
                     _camOrthoZoom = savedOrthoZoom;
                     CameraOverrideActive = true;
-                    _camOverrideFrames = 3;
+                    _camOverrideFrames = 6;
 
                     var cam2 = mgr.camera;
                     if (cam2 != null && cam2.camera != null)
                     {
+                        // kill any lerp coroutines LoadCraft started
+                        cam2.StopAllCoroutines();
+
                         cam2.Pivot = savedPivot;
                         cam2.zoom = savedZoom;
                         cam2.orthoSize = savedOrthoSize;
@@ -724,6 +783,7 @@ namespace UndoMod
             {
                 IsRestoring = false;
                 RestoreCooldownUntil = Time.time + 1.0f;
+                _restoreGuardUntil = Time.time + 2.0f;
                 SnapshotPending = false;
             }
         }
@@ -750,7 +810,9 @@ namespace UndoMod
                 cam.orthoZoom = _camOrthoZoom;
                 cam.camera.transform.position = _camPos;
                 cam.camera.transform.rotation = _camRot;
-                cam.ResetVelocity();
+                cam.pivotVelocity = Vector3.zero;
+                cam.rotationVel = Vector2.zero;
+                cam.zoomVel = 0f;
             }
         }
 
